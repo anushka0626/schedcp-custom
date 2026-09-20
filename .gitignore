@@ -1,0 +1,13 @@
+# Rust build artifacts
+target/
+**/target/
+
+# eBPF compiled binaries and kernel BTF dump
+*.o
+*.bpf.o
+vmlinux.h
+**/vmlinux.h
+
+# Editor and OS noise
+.DS_Store
+.vscode/
