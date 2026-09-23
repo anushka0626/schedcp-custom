@@ -89,12 +89,9 @@ impl SchedulerController {
             bail!("eBPF object file not found at: {}", obj_path);
         }
 
-        // Clean up any stale pin file left behind by prior crashes
-        if Path::new(&self.pinned_link_path).exists() {
-            let _ = Command::new("sudo")
-                .args(["rm", "-f", &self.pinned_link_path])
-                .output();
-        }
+        // Force cleanup of any previous pins and links before registering
+        let _ = Command::new("sudo").args(["rm", "-rf", &self.pinned_link_path]).output();
+        let _ = self.detach_struct_ops_links();
 
         let output = Command::new("sudo")
             .args(["bpftool", "struct_ops", "register", obj_path, BPF_FS_DIR])
@@ -110,21 +107,30 @@ impl SchedulerController {
     }
 
     fn unload(&self) -> Result<String> {
-        if Path::new(&self.pinned_link_path).exists() {
-            let output = Command::new("sudo")
-                .args(["rm", "-f", &self.pinned_link_path])
-                .output()
-                .context("Failed to remove pinned link")?;
+        let _ = Command::new("sudo")
+            .args(["rm", "-rf", &self.pinned_link_path])
+            .output();
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                bail!("Failed to remove pinned link: {}", stderr.trim());
-            }
-        } else {
-            self.detach_struct_ops_links()?;
-        }
+        self.detach_struct_ops_links()?;
         Ok("Scheduler unloaded. Kernel reverted to default EEVDF.".to_string())
     }
+
+    // fn unload(&self) -> Result<String> {
+    //     if Path::new(&self.pinned_link_path).exists() {
+    //         let output = Command::new("sudo")
+    //             .args(["rm", "-rf", &self.pinned_link_path])
+    //             .output()
+    //             .context("Failed to remove pinned link")?;
+
+    //         if !output.status.success() {
+    //             let stderr = String::from_utf8_lossy(&output.stderr);
+    //             bail!("Failed to remove pinned link: {}", stderr.trim());
+    //         }
+    //     } else {
+    //         self.detach_struct_ops_links()?;
+    //     }
+    //     Ok("Scheduler unloaded. Kernel reverted to default EEVDF.".to_string())
+    // }
 
     fn detach_struct_ops_links(&self) -> Result<()> {
         let output = Command::new("sudo")

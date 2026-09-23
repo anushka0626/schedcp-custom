@@ -7,11 +7,10 @@ import time
 
 PROJECT_DIR = os.path.expanduser("~/schedcp-project")
 DAEMON_PATH = os.path.join(PROJECT_DIR, "schedcp_daemon/target/release/schedcp_daemon")
-MINIMAL_OBJ = os.path.join(PROJECT_DIR, "bpf/minimal.bpf.o")
-BATCH_OBJ = os.path.join(PROJECT_DIR, "bpf/scx_batch.bpf.o")
+FIFO_OBJ = os.path.join(PROJECT_DIR, "bpf/scx_fifo.bpf.o")
+BATCH_OBJ = os.path.join(PROJECT_DIR, "bpf/scx_batch2.bpf.o")
 
 class McpClient:
-    """JSON-RPC Client interfacing with schedcp_daemon over STDIO."""
     def __init__(self, daemon_path):
         self.proc = subprocess.Popen(
             [daemon_path],
@@ -60,7 +59,6 @@ class McpClient:
         self.proc.wait()
 
 def run_probe_workload(threads=4, time_sec=5):
-    """Executes a short probe workload to profile the system behavior under load."""
     cmd = [
         "sudo", "perf", "stat",
         "-e", "task-clock,context-switches,cpu-migrations",
@@ -86,33 +84,32 @@ def run_probe_workload(threads=4, time_sec=5):
     }
 
 class AutotuneAgent:
-    """Agentic decision engine that determines and selects optimal scheduling policies."""
-    
     def __init__(self, mcp_client):
         self.client = mcp_client
 
     def profile_and_decide(self, baseline_metrics):
-        """Analyzes baseline metrics and forms an optimization hypothesis."""
         print("\n[Agent Thinking Process]")
         print(f"  * Baseline Events/sec : {baseline_metrics['eps']}")
         print(f"  * Baseline Ctx Switches: {baseline_metrics['context_switches']}")
         print(f"  * Baseline Migrations : {baseline_metrics['cpu_migrations']}")
 
-        # Decision reasoning
-        if baseline_metrics['context_switches'] > 5000:
+        # Systems decision:
+        # High preemption churn benefits from the partitioned batch queue with larger 30ms slice
+        if baseline_metrics['context_switches'] > 3000:
             hypothesis = (
-                "Workload exhibits severe context-switch preemption churn (>5000 switches). "
-                "Recommendation: Deploy 'scx_minimal' to enforce a static 5ms FIFO slice and suppress preemptions."
-            )
-            selected_scheduler = MINIMAL_OBJ
-            target_name = "scx_minimal"
-        else:
-            hypothesis = (
-                "Workload context switches are modest, indicating cache-affinity is priority. "
-                "Recommendation: Deploy 'scx_batch' with core-sticky select_cpu."
+                "Workload suffers from heavy context switching under EEVDF. "
+                "Recommendation: Deploy 'scx_batch2' (Partitioned Local Queues, 30ms slice) "
+                "to pin threads to cores and suppress preemption overhead."
             )
             selected_scheduler = BATCH_OBJ
-            target_name = "scx_batch"
+            target_name = "scx_batch2"
+        else:
+            hypothesis = (
+                "Workload preemption is low. "
+                "Recommendation: Deploy 'scx_fifo' (Global Work-Stealing) to maximize idle core utilization."
+            )
+            selected_scheduler = FIFO_OBJ
+            target_name = "scx_fifo"
 
         print(f"  -> Hypothesis: {hypothesis}")
         return selected_scheduler, target_name
@@ -122,38 +119,42 @@ class AutotuneAgent:
         print("       SchedCP Autonomous Tuning Loop Starting    ")
         print("==================================================")
 
-        # 1. Ensure clean baseline
-        subprocess.run(["sudo", "rm", "-f", "/sys/fs/bpf/minimal_ops"], capture_output=True)
-        #self.client.unload_scheduler()
+        # 1. Clean environment
+        subprocess.run(["sudo", "rm", "-rf", "/sys/fs/bpf/minimal_ops"], capture_output=True)
         self.client.unload_scheduler()
+
         print("\n[Phase 1] Profiling baseline workload under default Linux (EEVDF)...")
         baseline = run_probe_workload()
 
-        # 2. Agent reasons on baseline
+        # 2. Agent reasoning
         scheduler_path, target_name = self.profile_and_decide(baseline)
 
-        # 3. Agent applies decision via MCP
+        # 3. Apply via MCP
         print(f"\n[Phase 2] Agent applying optimization: Loading {target_name} via MCP...")
         load_res = self.client.load_scheduler(scheduler_path)
         print(f"  Server response: {load_res}")
+        print(f"  Active Status: {self.client.get_status()}")
 
-        # 4. Measure optimized run
+        # 4. Measure optimized
         print(f"\n[Phase 3] Profiling workload under {target_name}...")
         optimized = run_probe_workload()
 
-        # 5. Clean up / restore system
+        # 5. Clean up
         print("\n[Phase 4] Reverting system back to default EEVDF...")
         self.client.unload_scheduler()
+        print(f"  Active Status: {self.client.get_status()}")
 
-        # 6. Evaluation summary
+        # 6. Evaluation
         eps_gain = ((optimized['eps'] - baseline['eps']) / baseline['eps']) * 100
         ctx_delta = ((optimized['context_switches'] - baseline['context_switches']) / baseline['context_switches']) * 100
+        mig_delta = optimized['cpu_migrations'] - baseline['cpu_migrations']
 
         print("\n==================================================")
         print("               Autotune Results                   ")
         print("==================================================")
         print(f"Throughput Delta       : {eps_gain:+.2f}%")
         print(f"Context Switch Delta   : {ctx_delta:+.2f}%")
+        print(f"CPU Migration Shift    : {mig_delta:+d}")
         print(f"Selected Policy        : {target_name}")
         
         if eps_gain >= 0 or ctx_delta < 0:

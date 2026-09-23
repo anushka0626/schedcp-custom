@@ -13,11 +13,10 @@ import time
 
 PROJECT_DIR = os.path.expanduser("~/schedcp-project")
 DAEMON_PATH = os.path.join(PROJECT_DIR, "schedcp_daemon/target/release/schedcp_daemon")
-MINIMAL_OBJ = os.path.join(PROJECT_DIR, "bpf/minimal.bpf.o")
-BATCH_OBJ = os.path.join(PROJECT_DIR, "bpf/scx_batch.bpf.o")
+FIFO_OBJ = os.path.join(PROJECT_DIR, "bpf/scx_fifo.bpf.o")
+BATCH_OBJ = os.path.join(PROJECT_DIR, "bpf/scx_batch2.bpf.o")
 
 class McpClient:
-    """Minimal JSON-RPC client communicating with schedcp_daemon over STDIO."""
     def __init__(self, daemon_path):
         self.proc = subprocess.Popen(
             [daemon_path],
@@ -28,7 +27,7 @@ class McpClient:
             bufsize=1
         )
         self.msg_id = 0
-        self._init_handshake()
+        self._call("initialize")
 
     def _call(self, method, params=None):
         self.msg_id += 1
@@ -45,28 +44,16 @@ class McpClient:
             return None
         return json.loads(line.strip())
 
-    def _init_handshake(self):
-        self._call("initialize")
-
     def get_status(self):
-        res = self._call("tools/call", {
-            "name": "get_scheduler_status",
-            "arguments": {}
-        })
+        res = self._call("tools/call", {"name": "get_scheduler_status", "arguments": {}})
         return res["result"]["content"][0]["text"]
 
     def load_scheduler(self, path):
-        res = self._call("tools/call", {
-            "name": "load_scheduler",
-            "arguments": {"path": path}
-        })
+        res = self._call("tools/call", {"name": "load_scheduler", "arguments": {"path": path}})
         return res["result"]["content"][0]["text"]
 
     def unload_scheduler(self):
-        res = self._call("tools/call", {
-            "name": "unload_scheduler",
-            "arguments": {}
-        })
+        res = self._call("tools/call", {"name": "unload_scheduler", "arguments": {}})
         return res["result"]["content"][0]["text"]
 
     def close(self):
@@ -75,7 +62,6 @@ class McpClient:
         self.proc.wait()
 
 def run_workload(threads=4, time_sec=10):
-    """Runs sysbench under perf stat and parses results."""
     cmd = [
         "sudo", "perf", "stat",
         "-e", "task-clock,context-switches,cpu-migrations",
@@ -101,45 +87,44 @@ def run_workload(threads=4, time_sec=10):
     }
 
 def main():
-    print("=== SchedCP 3-Way Scheduler Benchmark ===")
+    print("=== SchedCP 3-Way Architectural Benchmark ===")
     client = McpClient(DAEMON_PATH)
 
     # 1. Baseline Run (EEVDF)
-    print("\n[1/3] Ensuring clean baseline (EEVDF)...")
+    print("\n[1/3] Ensuring baseline (EEVDF)...")
     client.unload_scheduler()
     print(f"      Status: {client.get_status()}")
-    print("      Running workload...")
     eevdf_stats = run_workload()
     time.sleep(1)
 
-    # 2. Minimal Run (5ms FIFO)
-    print("\n[2/3] Loading scx_minimal (5ms global FIFO)...")
-    client.load_scheduler(MINIMAL_OBJ)
+    # 2. Global Shared FIFO (scx_fifo)
+    print("\n[2/3] Loading scx_fifo (Global Work-Stealing FIFO)...")
+    load_msg = client.load_scheduler(FIFO_OBJ)
+    print(f"      Daemon: {load_msg}")
     print(f"      Status: {client.get_status()}")
-    print("      Running workload...")
-    minimal_stats = run_workload()
+    fifo_stats = run_workload()
     client.unload_scheduler()
     time.sleep(1)
 
-    # 3. Batch Run (20ms Affinity)
-    print("\n[3/3] Loading scx_batch (20ms affinity)...")
-    client.load_scheduler(BATCH_OBJ)
+    # 3. Partitioned Local Batch (scx_batch2)
+    print("\n[3/3] Loading scx_batch2 (Partitioned Core-Affinity Batch)...")
+    load_msg = client.load_scheduler(BATCH_OBJ)
+    print(f"      Daemon: {load_msg}")
     print(f"      Status: {client.get_status()}")
-    print("      Running workload...")
     batch_stats = run_workload()
     client.unload_scheduler()
     print(f"      Status: {client.get_status()}")
     client.close()
 
-    # 4. Side-by-side Table
-    print("\n" + "=" * 68)
-    print(f"{'Metric':<20} | {'EEVDF':<12} | {'scx_minimal':<12} | {'scx_batch':<12}")
-    print("-" * 68)
-    print(f"{'Events / sec':<20} | {eevdf_stats['eps']:<12.2f} | {minimal_stats['eps']:<12.2f} | {batch_stats['eps']:<12.2f}")
-    print(f"{'Context Switches':<20} | {eevdf_stats['context_switches']:<12} | {minimal_stats['context_switches']:<12} | {batch_stats['context_switches']:<12}")
-    print(f"{'CPU Migrations':<20} | {eevdf_stats['cpu_migrations']:<12} | {minimal_stats['cpu_migrations']:<12} | {batch_stats['cpu_migrations']:<12}")
-    print(f"{'Avg Latency (ms)':<20} | {eevdf_stats['avg_lat_ms']:<12.2f} | {minimal_stats['avg_lat_ms']:<12.2f} | {batch_stats['avg_lat_ms']:<12.2f}")
-    print("=" * 68)
+    # Results Table
+    print("\n" + "=" * 70)
+    print(f"{'Metric':<20} | {'EEVDF':<13} | {'scx_fifo':<13} | {'scx_batch2':<13}")
+    print("-" * 70)
+    print(f"{'Events / sec':<20} | {eevdf_stats['eps']:<13.2f} | {fifo_stats['eps']:<13.2f} | {batch_stats['eps']:<13.2f}")
+    print(f"{'Context Switches':<20} | {eevdf_stats['context_switches']:<13} | {fifo_stats['context_switches']:<13} | {batch_stats['context_switches']:<13}")
+    print(f"{'CPU Migrations':<20} | {eevdf_stats['cpu_migrations']:<13} | {fifo_stats['cpu_migrations']:<13} | {batch_stats['cpu_migrations']:<13}")
+    print(f"{'Avg Latency (ms)':<20} | {eevdf_stats['avg_lat_ms']:<13.2f} | {fifo_stats['avg_lat_ms']:<13.2f} | {batch_stats['avg_lat_ms']:<13.2f}")
+    print("=" * 70)
 
 if __name__ == "__main__":
     main()
