@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};  //Used for converting Rust structs ↔ JSON.
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -48,6 +48,37 @@ impl SchedulerController {
         } else {
             Ok(trimmed.to_string())
         }
+    }
+
+    /// Compiles a C eBPF source file into .bpf.o using clang
+    fn compile(&self, source_path: &str, output_path: &str, include_dir: &str) -> Result<String> {
+        if !Path::new(source_path).exists() {
+            bail!("Source file not found at: {}", source_path);
+        }
+
+        let output = Command::new("clang")
+            .args([
+                "-target", "bpf",
+                "-g",
+                "-O2",
+                "-c", source_path,
+                "-o", output_path,
+                &format!("-I{}", include_dir),
+            ])
+            .output()
+            .context("Failed to spawn clang process")?;
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            bail!("clang compilation failed:\n{}", stderr.trim());
+        }
+
+        Ok(format!(
+            "Successfully compiled {} -> {}. Warnings/Info:\n{}",
+            source_path,
+            output_path,
+            if stderr.trim().is_empty() { "None" } else { stderr.trim() }
+        ))
     }
 
     fn load(&self, obj_path: &str) -> Result<String> {
@@ -147,7 +178,6 @@ fn handle_request(req: JsonRpcRequest, controller: &SchedulerController) -> Opti
     let req_id = req.id.unwrap_or(Value::Null);
 
     let result = match req.method.as_str() {
-        // Handshake: Required by MCP clients on startup
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
             "serverInfo": {
@@ -159,10 +189,8 @@ fn handle_request(req: JsonRpcRequest, controller: &SchedulerController) -> Opti
             }
         })),
 
-        // Notifications: Sent after init, no response needed
         "notifications/initialized" => return None,
 
-        // Tool Discovery: Tells the AI what tools are available
         "tools/list" => Ok(json!({
             "tools": [
                 {
@@ -171,6 +199,28 @@ fn handle_request(req: JsonRpcRequest, controller: &SchedulerController) -> Opti
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
+                    }
+                },
+                {
+                    "name": "compile_scheduler",
+                    "description": "Compiles a C eBPF scheduler source file into bytecode (.bpf.o)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "source_path": {
+                                "type": "string",
+                                "description": "Absolute path to the C source file (.bpf.c)"
+                            },
+                            "output_path": {
+                                "type": "string",
+                                "description": "Absolute destination path for the compiled .bpf.o"
+                            },
+                            "include_dir": {
+                                "type": "string",
+                                "description": "Directory containing vmlinux.h and headers"
+                            }
+                        },
+                        "required": ["source_path", "output_path", "include_dir"]
                     }
                 },
                 {
@@ -198,7 +248,6 @@ fn handle_request(req: JsonRpcRequest, controller: &SchedulerController) -> Opti
             ]
         })),
 
-        // Tool Execution: Dispatches AI requests to the controller
         "tools/call" => {
             let tool_name = req.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let arguments = req.params.get("arguments").cloned().unwrap_or(json!({}));
@@ -216,17 +265,27 @@ fn handle_request(req: JsonRpcRequest, controller: &SchedulerController) -> Opti
                         ]
                     }))
                 }
+                "compile_scheduler" => {
+                    let source = arguments.get("source_path").and_then(|v| v.as_str()).unwrap_or("");
+                    let output = arguments.get("output_path").and_then(|v| v.as_str()).unwrap_or("");
+                    let include = arguments.get("include_dir").and_then(|v| v.as_str()).unwrap_or("");
+
+                    match controller.compile(source, output, include) {
+                        Ok(msg) => Ok(json!({ "content": [{ "type": "text", "text": msg }] })),
+                        Err(e) => Ok(json!({ "content": [{ "type": "text", "text": format!("Error: {:#}", e) }], "isError": true })),
+                    }
+                }
                 "load_scheduler" => {
                     let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
                     match controller.load(path) {
                         Ok(msg) => Ok(json!({ "content": [{ "type": "text", "text": msg }] })),
-                        Err(e) => Ok(json!({ "content": [{ "type": "text", "text": format!("Error: {:#}", e) }], "isError": true }))
+                        Err(e) => Ok(json!({ "content": [{ "type": "text", "text": format!("Error: {:#}", e) }], "isError": true })),
                     }
                 }
                 "unload_scheduler" => {
                     match controller.unload() {
                         Ok(msg) => Ok(json!({ "content": [{ "type": "text", "text": msg }] })),
-                        Err(e) => Ok(json!({ "content": [{ "type": "text", "text": format!("Error: {:#}", e) }], "isError": true }))
+                        Err(e) => Ok(json!({ "content": [{ "type": "text", "text": format!("Error: {:#}", e) }], "isError": true })),
                     }
                 }
                 _ => Err(json!({ "code": -32601, "message": format!("Unknown tool: {}", tool_name) })),
